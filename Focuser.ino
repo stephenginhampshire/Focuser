@@ -11,6 +11,7 @@
 	Version	Date		Description						Debug State		Debug Date
 	1.1		27/10/2018	Release Mark					untested		27/10/2018
 	1.1		16/12/2018	Load last position from EEPROM	untested
+	1.1.2	03/01/2019	Revised ASCOM support
 */
 #define VERSION_RELEASE	1
 #define VERSION_UPDATE	1
