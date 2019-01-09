@@ -13,6 +13,7 @@
 	1.1		16/12/2018	Load last position from EEPROM	untested
 	1.1.2	03/01/2019	Revised ASCOM support
 */
+#include <myeepromanything.h>
 #define VERSION_RELEASE	1
 #define VERSION_UPDATE	1
 /* Functionality Checklist ------------------------------------------------------------------------------------------
@@ -92,6 +93,49 @@
 
 #define LED_FLASH_TIME		20           // number of milli seconds to light the LEDs
 
+#define LCDUPDATESTEPCOUNT  15            // the number of steps moved which triggers an lcd update when moving, do not make too small
+#define LCDPAGEDISPLAYTIME  25            // time in milliseconds that each lcd page is displayed for (2000-4000)
+#define TEMPREFRESHRATE     1000L         // refresh rate between temperature conversions unless an update is requested via serial command
+#define HOMESTEPS           200           // Prevent searching for home position switch never returning, this should be > than # of steps between closed and open
+
+// ----------------------------------------------------------------------------------------------------------
+// GLOBAL DEFINES
+// DO NOT CHANGE
+#define PBSWITCHESPIN       A0            // push button switches
+#define INLED               A1            // in and out leds
+#define OUTLED              A2
+#define BUZZERPIN           A3            // buzzer
+#define TEMPPIN             2             // temperature probe on pin 2, use 4.7k pullup
+#define HPSWPIN             12            // home position switch is on D12
+
+#define EEPROMSIZE          1024          // ATMEGA328P 1024 EEPROM
+#define VALIDDATAFLAG       99            // valid eeprom data flag
+#define SLOW                0             // motorspeeds
+#define MED                 1
+#define FAST                2
+#define STEP1               1             // step modes
+#define STEP2               2
+#define STEP4				4
+#define STEP8				8
+#define STEP16				16
+#define STEP32				32
+#define STEP64				64
+#define STEP128				128
+
+#define MOTORPULSETIME      5             // requires minimum 5uS pulse to step
+#define MOVINGIN            0
+#define MOVINGOUT           1
+#define FOCUSERUPPERLIMIT   2000000000L   // arbitary focuser limit up to 2000000000
+#define FOCUSERLOWERLIMIT   1024L         // lowest value that maxsteps can be
+#define DEFAULTSTEPSIZE     50.0          // This is the default setting for the step size in microns
+#define MINSTEPSIZE         0.001         // this is the minimum step size in microns
+#define EEPROMWRITEINTERVAL 10000L        // interval in milliseconds to wait after a move before writing settings to EEPROM, 10s
+#define HPSWOPEN            HIGH
+#define HPSWCLOSED          LOW
+#define DISPLAYPAGETIMEMAX  40
+#define DISPLAYPAGETIMEMIN  20
+
+
 // includes ---------------------------------------------------------------------------------------------------------
 #include <TimeLib.h>
 #include <Time.h>
@@ -102,7 +146,9 @@
 #include <DHT_U.h>
 #include <MicroNMEA.h>
 #include <MemoryFree.h>
-#include <EEPROM.h>
+//#include <EEPROM.h>
+#include <myEEPROM.h>
+#include <Bounce2.h>  
 #include "D:/Dropbox/Motor_Controller/Ascom_Development/Telescope_Hub/HUB_Commands.h"
 
 
@@ -137,7 +183,7 @@ union sg_int_union {
 typedef struct {
   unsigned char header;             // [0] STX
   unsigned char command_number;     // [1] Command Number
-  unsigned int focuser_target;		// [2 - 3]
+  unsigned int focuser_parameter;		// [2 - 3]
   unsigned int focuser_direction;	// [4 - 5]
   unsigned char footer;             // [6] ETX
 } HUB_incoming_message_structure;
@@ -179,6 +225,35 @@ unsigned char hub_outptr = 0;
 unsigned char hub_inptr = 0;
 unsigned char hub_inbuffer[0xff];
 unsigned char hub_string_ptr = 0;
+
+
+struct config_t {
+	int validdata;								// if this is 99 then data is valid
+	long position;								// last focuser position
+	long maximum_step;							// max steps
+	double step_size;							// the step size in microns, ie 7.2, minimum value is 0.001 microns
+	double step_mode;							// stepping mode, full, half, 1/4, 1/8. 1/16. 1/32 [1.2.4.8.16.32]
+	double reverse_direction;					// reverse direction
+	double coil_power;							// coil pwr
+	double temperature_mode;					// temperature display mode, Celcius=1, Fahrenheit=0
+	double pagedisplaytime;						// refresh rate of display - time each page is displayed for
+	double step_size_enabled;					// if 1, controller returns step size
+	double seven_segment_update_on_move;		// update position on lcd when moving
+	double temperature_compensation_enabled;	// indicates if temperature compensation is enabled
+	double temperature_coefficient;				// steps per degree temperature coefficient value
+	double delay_after_move;					// delay after movement is finished
+	double backlash_steps_in;					// number of backlash steps to apply for IN moves
+	double backlash_steps_out;					// number of backlash steps to apply for OUT moves
+	double focuser_direction;					// keeps track of last focuser move direction
+	double backlash_in_enabled;					// enable or disable backlash compensation for IN
+	double backlash_out_enabled;				// enable or disable backlash compensation for OUT
+	double tc_direction;
+} myfocuser;
+
+long previous_millis = 0;
+unsigned int current_address = 0;
+
+
 long last_status_update = 0;
 long last_display_update = 0;
 unsigned int microsteps_target = 0;
@@ -243,6 +318,8 @@ const byte O = 0b01111110;
 const byte space = 0b00000000;
 bool focuser_display_on = true;				// default to true - display ON
 int timer1_counter;
+int home_position_switchstate;
+int homeposflag;
 // instantiations -----------------------------------------------------------------------------------------------------
 AMIS30543 stepper;
 DHT_Unified dht(DHT22_PIN, DHT22);
@@ -250,6 +327,7 @@ sensors_event_t event;
 sensor_t sensor;
 MicroNMEA gps_nmea(gps_nmeaBuffer, sizeof(gps_nmeaBuffer));
 HardwareSerial& gps_serial = GPS_serial;
+Bounce home_position_switchbounce = Bounce();             // setup debouncer for hp switch
 // ISRs ---------------------------------------------------------------------------------------------------------------
 void serialEvent1() { // Hub Serial Port Interrupt Service Routine
 	while (HUB_serial.available()) {
@@ -270,6 +348,10 @@ ISR(TIMER1_OVF_vect) {						// interrupt service routine
 }
 // setup --------------------------------------------------------------------------------------------------------------
 void setup() {
+	byte found = 0;
+	unsigned int data_size = 0;
+	unsigned int number_locations = 0;
+
 	Serial.begin(38400);				// start the console serial port at 38400 baud
 	pinMode(13, OUTPUT);				// define the yellow led pin as an output
 	digitalWrite(13, LOW);				// Turn off the yellow LED.
@@ -328,6 +410,77 @@ void setup() {
 	TCCR1B |= (1 << CS12);		// 256 prescaler 
 	TIMSK1 |= (1 << TOIE1);		// enable timer overflow interrupt
 	interrupts();				// enable all interrupts
+
+	current_address = 0;                          // start at 0 if not found later
+	found = 0;
+	data_size = sizeof(myfocuser);
+	number_locations = EEPROMSIZE / data_size;
+	for (int lp1 = 0; lp1 < number_locations; lp1++)
+	{
+		int address = lp1 * data_size;
+		EEPROM_readAnything(address, myfocuser);
+		if (myfocuser.validdata == VALIDDATAFLAG) // check to see if the data is valid
+		{
+			current_address = address;                       // data was erased so write some default values
+			found = 1;
+		}
+	}
+	if (found == 1) {
+		// set the focuser back to the previous settings
+		// done after this in one hit
+		// mark current eeprom address as invalid and use next one
+		// each time focuser starts it will read current storage, set it to invalid, goto next location and
+		// write values to there and set it to valid - so it doesnt always try to use same locations over and
+		// over and destroy the eeprom
+		// using it like an array of [0-nlocations], ie 100 storage locations for 1k EEPROM
+		EEPROM_readAnything(current_address, myfocuser);
+		myfocuser.validdata = 0;
+		writeEEPROMNow();                       // update values in EEPROM
+		current_address += data_size;                // goto next free address and write data
+		// bound check the eeprom storage and if greater than last index [0-EEPROMSIZE-1] then set to 0
+		if (current_address >= (number_locations * data_size))
+			current_address = 0;
+		myfocuser.validdata = VALIDDATAFLAG;
+		writeEEPROMNow();                       // update values in EEPROM
+	}
+	else {
+		set_focuser_defaults(); 	// set defaults because not found
+	}
+	myfocuser.temperature_compensation_enabled = 0;        // disable temperature compensation on startup else focuser will auto adjust whilst focusing!
+
+// range check focuser variables
+	if (myfocuser.maximum_step < FOCUSERLOWERLIMIT)
+		myfocuser.maximum_step = FOCUSERLOWERLIMIT;
+	if (myfocuser.position < 0)
+		myfocuser.position = 0;
+	else if (myfocuser.position > myfocuser.maximum_step)
+		myfocuser.position = myfocuser.maximum_step;
+	if (myfocuser.step_size < 0)
+		myfocuser.step_size = 0;
+	else if (myfocuser.step_size > (double) DEFAULTSTEPSIZE)
+		myfocuser.step_size = (double) DEFAULTSTEPSIZE;
+	if (myfocuser.delay_after_move > 250)
+		myfocuser.delay_after_move = 250;
+	myfocuser.focuser_direction = myfocuser.focuser_direction & 0x01;
+	move_direction = myfocuser.focuser_direction;
+	if (myfocuser.temperature_coefficient > 200)
+		myfocuser.temperature_coefficient = 200;
+
+#ifdef DEBUG
+	Serial.print("myfocuser.position = ");
+	Serial.println(myfocuser.position);
+#endif
+	current_position = myfocuser.position;
+	target_position = myfocuser.position;
+
+	if (!myfocuser.coil_power)
+		clear_output();
+	myfocuser.step_mode = myfocuser.step_mode & 0x01;
+	motor_speed = FAST;
+	saved_motor_speed = FAST;
+	update_motor_speed_delay();
+	write_now = 1;                             // ensure validated values are saved
+
 	Home();									// Position the focuser to home
 	Move_to(Get_LastPosition());			// move to the last position
 	send_update_to_SEVEN_SEGMENT();
@@ -354,7 +507,6 @@ void loop() {
 		}
 	}
 	if (incoming_gps_packet_available == true) Parse_Incoming_gps_packet();       // if a gps packet has arrived parse it
-
 	if ((gps_status == true) && (millis() >= gps_time_LED_On + LED_FLASH_TIME)) {	// switch the gps led off
 		digitalWrite(GPS_LED_pin, LOW);
 		gps_status = false;
@@ -366,6 +518,198 @@ void loop() {
 	if ((hub_status == true) && (millis() >= hub_time_LED_On + LED_FLASH_TIME)) {	// switch the hub led off
 		digitalWrite(HUB_LED_pin, LOW);
 		hub_status = false;
+	}
+	if (queue.count() >= 1) {                 // check for serial command
+		processCommand();
+	}
+	digitalWrite(INLED, 0);                // turn off the IN/OUT LEDS and BUZZER
+	digitalWrite(OUTLED, 0);
+	digitalWrite(BUZZERPIN, 0);
+	if (myfocuser.temperature_compensation_enabled == 0) {
+		int PBVal = readpbswitches(PBSWITCHESPIN);
+		if (PBVal != 0) {
+			delay(50);                             // wait small delay in case user is holding pb down
+			PBVal = readpbswitches(PBSWITCHESPIN);
+			if (PBVal != 0) {
+				switch (PBVal) {                      // now check the pbval using a switch for 1 2 and 3
+					case 1:                             // toggle sw1 is ON and 2 is off
+														// move IN
+						move_direction = MOVINGIN;
+						myfocuser.focuser_direction = move_direction;
+						move_started = 1;
+						is_moving = 1;
+						target_position--;
+						if (target_position < 0) target_position = 0;
+						update_position_seven_segment();
+						break;
+					case 2:                             // toggle sw2 is ON and SW1 is OFF
+														// move OUT
+						move_direction = MOVINGOUT;
+						myfocuser.focuser_direction = move_direction;
+						move_started = 1;
+						is_moving = 1;
+						target_position = target_position + 1;
+						if (target_position > myfocuser.max_step) target_position = myfocuser.max_step;
+						update_position_seven_segment();
+						break;
+					case 3:                             // toggle sw1 and sw2 are ON
+						digitalWrite(BUZZERPIN, 1);       // turn on buzzer
+						while (read_pb_switches(PBSWITCHESPIN) == 3)  // wait for pb to be released
+							;
+						current_position = 0;
+						target_position = 0;
+						is_moving = 0;
+						digitalWrite(BUZZERPIN, 0);       // turn off buzzer
+						break;
+					default:
+															// do nothing
+						break;
+				} // end of switch
+			}
+		}
+	}
+	if (myfocuser.temperature_compensation_enabled == 0) {
+		if (jogging == 1) {
+			move_started = 1;
+			is_moving = 1;
+			if (jogging_direction == 0) {				// move IN
+				move_direction = MOVINGIN;
+				myfocuser.focuser_direction = move_direction;
+				move_started = 1;
+				target_position--;
+				if (target_position < 0)
+					target_position = 0;
+				update_position_seven_segment();
+			}else{										// move OUT
+				move_direction = MOVINGOUT;
+				myfocuser.focuser_direction = move_direction;
+				move_started = 1;
+				target_position++;
+				if (target_position > myfocuser.max_step)
+					target_position = myfocuser.max_step;
+				update_position_seven_segment();
+			}
+		}
+	}
+	if (target_position != current_position) { 	// Move the position by a single step if target <> current position
+		is_moving = 1;                        // focuser is moving
+		flag_eeprom_update();
+		if (motor_speed_change == 1) {
+			long nearing_home_position = current_position - target_position; 			// Slow down if approaching home position
+			nearing_home_position = abs(nearing_home_position);
+			if (nearing_home_position < tsw_threshold) {
+				motor_speed = SLOW;                           // slow
+				update_motor_speed_delay();
+			}
+		}
+		if (targetPosition < currentPosition) {	// Going Anticlockwise to lower position
+			anticlockwise();
+			current_position--;
+		}
+		if (targetPosition > currentPosition) { 		// Going Clockwise to higher position}
+			clockwise();
+			current_position++;
+		}
+
+		hpswbounce.update();            // we need to call update to read home position switch state, no interrupts are used
+		hpswstate = hpswbounce.read();  // reads the home position switch state
+
+		// if switch state = CLOSED and currentPosition != 0
+		// need to back OUT a little till switch opens and then set position to 0
+		if ((hpswstate == HPSWCLOSED) && (currentPosition != 0)) {
+			is_moving = 1;
+			// need to back OUT a little till switch opens and then set position to 0
+			settohome();
+			is_moving = 0;
+		}
+		// else if switch state = CLOSED and Position = 0
+		// need to back OUT a little till switch opens and then set position to 0
+		else if ((hpswstate == HPSWCLOSED) && (currentPosition == 0)) {
+			is_moving = 1;
+			// need to back OUT a little till switch opens and then set position to 0
+			set_to_home();
+			is_moving = 0;
+		}
+		// else if switchstate = OPEN and Position = 0
+		// need to move IN a little till switch CLOSES then
+		else if ((hpswstate == HPSWOPEN) && (currentPosition == 0)) {
+			is_moving = 1;
+			// need to move IN a little till switch CLOSES then
+			move_to_home();
+			// need to back OUT a little till switch opens and then set position to 0
+			set_to_home();
+			is_moving = 0;
+		}
+
+		if (myfocuser.seven_segment_update_on_move == 1) { 		// check if seven segment needs updating during move
+			update_count++;
+			if (updatecount > SEVENSEGMENTUPDATESTEPCOUNT) {
+				update_position_seven_segment();
+				update_count = 0;
+			}
+		}
+		update_motor_speed_delay();
+		delay(motor_speed_delay);  // required else stepper will not move
+	}
+	else {
+		is_moving = 0; 					// focuser has reached target, focuser is NOT moving now, move is completed
+										// clear state of home position
+		hpswbounce.update();            // we need to call update to read home position switch state, no interrupts are used
+		hpswstate = hpswbounce.read();  // clear any 0 readings
+		motor_speed = saved_motor_speed;       // restore original motorSpeed
+		update_motor_speeddelay();
+		long currentMillis = millis();   		// see if the display needs updating
+		if (((currentMillis - old_display_timestamp_not_moving) > (myfocuser.page_display_time * 100)) || (current_millis < old_display_timestamp_not_moving))
+		{
+			old_display_timestamp_not_moving = current_millis;    // update the timestamp
+			seven_segment.clear();
+		}
+		long temperature_now = millis();
+			// see if the temperature needs updating - done automatically every 5s
+		if (((temperature_now - last_temperature_conversion) > TEMPREFRESHRATE) || (temperature_now < last_temperature_conversion)) {
+			last_temperature_conversion = millis();      // update
+			if (request_temperature_flag == 0) {
+				read_temperature();
+				request_temperature_flag = 1;
+			}else{
+				request_temperature();
+				request_temperature_flag = 0;
+			}
+		} // end of check to see if it is time to get new temperature reading
+		// check for temperature compensation;
+		if (myfocuser.temperature_compensation_enabled == 1) {
+			if (tc_started == 0) {
+				tc_started = 1;
+				start_temperature_value = ch1tempval;
+			}
+			// if temperature has changed by 1 degree
+			double temperature_change = start_temperature_value - ch1tempval;
+			if (temperature_change >= 1) {
+				// move the focuser by the required amount
+				// this should move focuser inwards
+				new_position = target_position - myfocuser.temperature_coefficient;
+				// rangecheck target
+				if (new_position < 0)
+					new_position = 0;
+				if (new_position > myfocuser.max_step)
+					new_position = myfocuser.max_step;
+				move_started = 1;
+				target_position = new_position;
+				tc_started = 0;                  // indicate that temp compensation was done
+			} // end of check for tempchange >=1
+		} // end of check for tempcompenabled == 1)
+		if (write_now == 1) {	// is it time to update EEPROM settings?
+			// decide if we have waited 10s (value of EEPROMWRITEINTERVAL) after the last myfocuser key variable update, if so, update the EEPROM
+			long current_millis = millis();
+			if (((current_millis - previous_millis) > EEPROMWRITEINTERVAL) || (current_millis < previous_millis)) {
+				myfocuser.validdata = VALIDDATAFLAG;
+				myfocuser.position = current_position;
+				writeEEPROMNow();                   // update values in EEPROM
+				write_now = 0;
+				previous_millis = current_millis;     // update the timestamp
+			}
+		}
+		if (!myfocuser.coil_power) clear_output();
 	}
 } 
 // Get last position --------------------------------------------------------------------------------------------------
@@ -697,7 +1041,356 @@ void Parse_Hub_Incoming_Message() {
 		Serial.print(millis(), DEC);
 		Serial.println("\tPacket Received from HUB");
 #endif
-	switch (incoming_hub_message.hub_incoming_message.command_number) {
+		switch (incoming_hub_message.hub_incoming_message.command_number) {
+			//----------------------------------------------------------------------------------------------------
+		case 0: // get current focuser position
+			sendresponse(current_position);
+			break;
+		case 1: // get motor moving status - 01 if moving, 00 otherwise
+			sendresponse(isMoving);
+			break;
+		case 2: // get motor controller status - Controller Response to "connected"
+			sendresponse(OK);
+			break;
+		case 3: // get firmware version string
+			sendresponse(firmware_version);
+			break;
+		case 6: // get temperature as a double XXXX
+			sendresponse(current_temperature);
+			break;
+		case 8: // get MaxStep, returns XXXXXX
+			sendresponse(myfocuser.maximum_step);
+			break;
+		case 10: // get MaxIncrement, returns xxxxxx
+			sendresponse(myfocuser.maximum_increment);
+			break;
+		case 11: // get coil pwr setting (00 = coils released after move, 01 = coil pwr on after move)
+			sendresponse(myfocuser.coil_power_setting);
+			break;
+		case 13: // get reverse direction setting, 00 off, 01 on
+			sendresponse(myfocuser.reverse_direction);
+			break;
+		case 24: // get state of Temperature Compensation, 0=disabled, 1=enabled
+			sendresponse(myfocuser.temperature_compensation_state);
+			break;
+		case 25: // get if Temperature Compensation available 0=No, 1=Yes
+			sendresponse(OK);
+			break;
+		case 26: // get Temperature Coefficient (in steps per degree)
+			sendresponse(myfocuser.temperature_coefficient);
+			break;
+		case 29: // get stepmode, returns XX#
+			sendresponse(myfocuser.stepmode);
+			break;
+		case 32: // get if stepsize is enabled in controller (1 or 0, 0/1)
+			sendresponse(myfocuser.step_size_enabled);
+			break;
+		case 33: // get step size in microns (if enabled by controller)
+			sendresponse(myfocuser.step_size);
+			break;
+		case 34: // get the time that an LCD screen is displayed for (in milliseconds, eg 2500 = 2.5seconds
+			sendresponse(myfocuser.pagedisplaytime);
+			break;
+		case 37: // get Display status 0=disabled, 1=enabled
+			sendresponse(display_enabled);
+			break;
+		case 38: // get Temperature mode 1=Celsius, 0=Fahrenheight
+			sendresponse(myfocuser.tempmode);
+			break;
+		case 39: // get the new motor position (target) XXXXXX
+			sendresponse(target_position);
+			break;
+		case 43: // get motorspeed (0-3)
+			sendresponse(motor_speed);
+			break;
+		case 45: // get tswthreshold - value for which stepper slows down at end of its move
+			sendresponse(tswthreshold);
+			break;
+		case 47: // get if motorspeedchange enabled/disabled
+			sendresponse(motor_speed_change);
+			break;
+		case 62: // get update of position on lcd when moving (00=disable, 01=enable)
+			sendresponse(myfocuser.lcd_update_on_move);
+			break;
+		case 63: // get status of home position switch (0=open, 1=closed)
+			home_position_switchbounce.update();                // we need to call update to read home position switch state, no interrupts are used
+			sendresponse(home_position_switchbounce.read();;                 // home switch activated
+			break;
+		case 66: // get jogging state enabled/disabled
+			sendresponse(jogging_state);
+			break;
+		case 68: // get jogging direction 0=IN, 1=OUT
+			sendresponse(jogging_direction);
+			break;
+		case 41:  // Troubleshooting only
+			sendresponse(null);
+			break;
+		case 72: // gets DelayAfterMove
+			sendresponse(myfocuser.delay_after_move);
+			break;
+		case 74: // get backlash in enabled status
+			sendresponse(myfocuser.backlash_in_enabled);
+			break;
+		case 76:  // get backlash OUT enabled status
+			sendresponse(myfocuser.backlash_out_enabled);
+			break;
+		case 78: // get number of backlash steps IN
+			sendresponse(myfocuser.backlashsteps_in);
+			break;
+		case 80: // get number of backlash steps OUT
+			sendresponse(myfocuser.backlashsteps_out);
+			break;
+		case 87: // get temp comp direction 1=IN
+			sendresponse(myfocuser.tcdirection);
+			break;
+		case 5:  // Set new target position to xxxxxx (and focuser initiates immediate move to xxxxxx)
+			target_position = incoming_hub_message.hub_incoming_message.focuser_parameter;
+			if (target_position < current_position) {
+				move_direction = MOVINGIN;
+			}
+			else {
+				move_direction = MOVINGOUT;
+			}
+			isMoving = true;
+			break;
+		case 28: // home the motor to position 0
+			if (myfocuser.tempcompenabled == 0) {
+				if (cmdval == 28) {
+					newPos = 0;                   // if this is a home then set target to 0
+				}
+				else {
+					pos = decstr2long(param);     // else set target to a move command
+					newPos = pos;
+				}
+				isMoving = true;
+				if (target_position < current_position) {
+					move_direction = MOVINGIN;
+				}
+				else {
+					move_direction = MOVINGOUT;
+				}
+				Serial.print("- Current Position = "); Serial.print(currentPosition); Serial.print("#");
+				Serial.print("- Target Position = "); Serial.print(newPos); Serial.print("#");
+				Serial.print("- Previous direction = "); Serial.print(myfocuser.focuserdirection); Serial.print("#");
+				Serial.print("- New Direction = "); Serial.print(movedirection); Serial.print("#");
+														// determine if a change in direction has taken place
+				if (move_direction != myfocuser.focuser_direction) {
+					Serial.print("- Applying backlash#");
+					long tmppos = newPos;
+														// apply backlash because moving in opposite direction
+					if (movedirection == MOVINGIN) {
+						Serial.print("- Backlash Steps IN="); Serial.print(myfocuser.backlashsteps_in); Serial.print("#");
+														// apply IN backlash steps
+						for (int steps = 0; steps < myfocuser.backlashsteps_in; steps++) {
+							anticlockwise();
+							delayMicroseconds(MOTORPULSETIME);
+							tmppos--;
+							if (tmppos <= 0) {
+								newPos = 0;
+								break;
+							}
+						}
+					} else {
+						Serial.print("- Backlash steps OUT="); Serial.print(myfocuser.backlashsteps_out); Serial.print("#");
+														// apply OUT backlash steps
+						for (int steps = 0; steps < myfocuser.backlashsteps_out; steps++) {
+							clockwise();
+							delayMicroseconds(MOTORPULSETIME);
+							tmppos++;
+							if (tmppos >= myfocuser.maxstep) {
+								newPos = myfocuser.maxstep;
+								break;
+							}
+						}
+					}
+					myfocuser.focuser_direction = move_direction;
+				}
+				Serial.print("- 2s delay before move#");
+				delay(2000);
+														// rangecheck target
+				if (newPos < 0)
+					newPos = 0;
+				if (newPos > myfocuser.maxstep)
+					newPos = myfocuser.maxstep;
+				movestarted = 1;
+				Serial.print("- Move to position "); Serial.print(newPos); Serial.print("#");
+				targetPosition = newPos;
+				updatepositionlcd();
+				flageepromupdate();
+			}
+			break;
+		case 7: // set MaxStep
+			myfocuser.max_step = incoming_hub_message.hub_incoming_message.focuser_parameter);
+			if (myfocuser.max_step > FOCUSERUPPERLIMIT)            // range check the new value for maxSteps
+				myfocuser.max_step = FOCUSERUPPERLIMIT;
+			if (myfocuser.max_step < FOCUSERLOWERLIMIT)            // avoid setting maxSteps too low
+				myfocuser.max_step = FOCUSERLOWERLIMIT;
+			flageepromupdate();
+			break;
+		case 12: // set coil pwr 0=release pwr after move, 1=keep power on after move
+			myfocuser.coil_power = incoming_hub_message.hub_incoming_message.focuser_parameter & 0x01;
+			flageepromupdate();
+			break;
+		case 14: // set reverse direction setting 0=normal, 1=reverse
+			myfocuser.ReverseDirection = incoming_hub_message.hub_incoming_message.focuser_parameter & 0x01;
+			flageepromupdate();
+			break;
+		case 15: // set MotorSpeed, 00 = Slow, 01 = Med, 02 = Fast
+			motor_speed = saved_motor_speed = incoming_hub_message.hub_incoming_message.focuser_parameter & 0x03;
+			updatemotorSpeedDelay();
+			break;
+		case 16: // set display to Celsius
+			myfocuser.temperature_mode = 1;
+			flageepromupdate();
+			break;
+		case 17: // set display to Fahrenheit
+			myfocuser.temperature_mode = 0;
+			flageepromupdate();
+			break;
+		case 18: // set the return of user specified stepsize 0=OFF(default), 1=ON - reports what user specified as stepsize
+			myfocuser.stepsizeenabled = incoming_hub_message.hub_incoming_message.focuser_parameter & 0x01;
+			flageepromupdate();
+			break;
+		case 19:  // :19xxxx#  None   set the step size value - double type, eg 2.1
+			double temp_step_size = (double)incoming_hub_message.hub_incoming_message.focuser_parameter.toFloat();
+			if (temp_step_size < MINSTEPSIZE)
+				tempstepsize = DEFAULTSTEPSIZE;       // set default maximum stepsize
+			myfocuser.step_size = temp_step_size;
+			flageepromupdate();
+			break
+		case 22:  // :22xxx#    None    set the temperature compensation value to xxx
+			double paramval = incoming_hub_message.hub_incoming_message.focuser_parameter;
+			if (paramval < 0)
+				paramval = 0;
+			else if (paramval > 200)
+				paramval = 200;
+			myfocuser.temperature_compensation = (byte)paramval;     // save setting in EEPROM
+			flageepromupdate();
+			break;
+		case 23:  // set the temperature compensation ON (1) or OFF (0)
+			myfocuser.tempcompenabled = incoming_hub_message.hub_incoming_message.focuser_parameter & 0x01;
+			flageepromupdate();
+			break;
+		case 30:  // set stepmode (1=Full, 2=Half)
+			myfocuser.step_mode = incoming_hub_message.hub_incoming_message.focuser_parameter & 0x03;
+			setstepmode(myfocuser.step_mode);
+			update_motor_speed_delay();
+			flageepromupdate();
+			break;
+		case 31:  // set current motor position to xxxxxx (does not move, updates currentpos and targetpos to xxxxxx)
+			new_position = incoming_hub_message.hub_incoming_message.focuser_parameter;
+										// rangecheck target
+			if (new_position < 0)
+				new_position = 0;
+			if (new_position > myfocuser.max_step)
+			new_position = myfocuser.max_step;
+			isMoving = 0;
+			current_position = target_position = new_position;
+			flageepromupdate();
+			break;
+		case 35:  // set length of time an LCD page is displayed for in milliseconds
+			position = incoming_hub_message.hub_incoming_message.focuser_parameter;
+			if (position < DISPLAYPAGETIMEMIN)           // bounds check to 2000-4000 2s-4s
+				position = DISPLAYPAGETIMEMIN;
+			if (position > DISPLAYPAGETIMEMAX)
+				position = DISPLAYPAGETIMEMAX;
+			myfocuser.page_display_time = position;
+			flageepromupdate();
+			break;
+		case 36:
+		// :360#    None    Disable Display
+		// :361#    None    Enable Display
+			display_enabled = incoming_hub_message.hub_incoming_message.focuser_parameter & 0x01;
+			if (displayenabled == 0) {
+				lcd.noDisplay();
+			} else {
+				lcd.display();
+			}
+			break;
+		case 40: // reset Arduino controller
+			software_Reboot();
+			break;
+		case 44: // set motorspeed threshold when moving - switches to slowspeed when nearing destination
+			paramval = incoming_hub_message.hub_incoming_message.focuser_parameter;
+			if (paramval < 50)                  // range check
+				paramval = 50;
+			else if (paramval > 200)
+				paramval = 200;
+			tswthreshold = (byte)paramval;
+			break;
+		case 46: // Enable/Disable motorspeed change when moving
+			motorspeedchange = incoming_hub_message.hub_incoming_message.focuser_parameter & 0x01;
+			break;
+		case 48: // Save settings to EEPROM
+			myfocuser.valid_data = VALIDDATAFLAG;
+			myfocuser.position = currentPosition;
+			writeEEPROMNow();
+			writenow = 0;
+			break;
+		case 61: // set update of position on lcd when moving (00=disable, 01=enable)
+			myfocuser.lcdupdateonmove = incoming_hub_message.hub_incoming_message.focuser_parameter & 0x01;
+			flageepromupdate();
+			break;
+		case 64: // move a specified number of steps
+			isMoving = 1;
+			movestarted = 1;
+			target_position = currentPosition + incoming_hub_message.hub_incoming_message.focuser_parameter;
+			// rangecheck target
+			if (target_position < 0)
+				target_position = 0;
+			if (target_position > myfocuser.max_step)
+				target_position = myfocuser.max_step;
+			flageepromupdate();
+			break;
+		case 65: // set jogging state enable/disable
+			jogging = incoming_hub_message.hub_incoming_message.focuser_parameter & 0x01;
+			break;
+		case 67:  // :67#     None    Set jogging direction, 0=IN, 1=OUT
+			joggingDirection = incoming_hub_message.hub_incoming_message.focuser_parameter & 0x01;
+			break;
+		case 42: // Reset focuser defaults
+			current_address = 0;
+			set_focuser_defaults();
+			current_position = myfocuser.position;
+			target_position = myfocuser.position;
+			break;
+		case 71: // set DelayAfterMove in milliseconds
+			paramval = incoming_hub_message.hub_incoming_message.focuser_parameter;
+												// bounds check to 0-250
+			if (paramval < 0)
+				paramval = 0;
+			if (paramval > 250)
+				paramval = 250;
+			myfocuser.DelayAfterMove = (byte)paramval;
+			flageepromupdate();
+			break;
+		case 73: // Disable/enable backlash IN (going to lower focuser position)
+			myfocuser.backlash_in_enabled = incoming_hub_message.hub_incoming_message.focuser_parameter & 0x01;
+			flageepromupdate();
+			break;
+		case 75: // Disable/enable backlash OUT (going to lower focuser position)
+			myfocuser.backlash_out_enabled = incoming_hub_message.hub_incoming_message.focuser_parameter & 0x01;
+			flageepromupdate();
+			break;
+		case 77: // set backlash in steps
+			paramval = incoming_hub_message.hub_incoming_message.focuser_parameter;
+			if (paramval < 0)                   // range check
+				paramval = 0;
+			myfocuser.backlash_steps_in = (byte)paramval;
+			flageepromupdate();
+			break;
+		case 79: // set backlash OUT steps
+			paramval = incoming_hub_message.hub_incoming_message.focuser_parameter;
+			if (paramval < 0)                   // range check
+				paramval = 0;
+			myfocuser.backlash_steps_out = (byte)paramval;
+			flageepromupdate();
+			break;
+		case 88: // set temp comp direction 1=IN
+			myfocuser.tc_direction = incoming_hub_message.hub_incoming_message.focuser_parameter & 0x01;
+			flageepromupdate();
+			break;
+//----------------------------------------------------------------------------------------------------
 		case Focuser_Home_command: {
 			Home();
 			break;
@@ -708,12 +1401,12 @@ void Parse_Hub_Incoming_Message() {
 			break;
 		} // end of case halt
 		case Focuser_Move_to_command: {
-			microsteps_target = incoming_hub_message.hub_incoming_message.focuser_target;
+			microsteps_target = incoming_hub_message.hub_incoming_message.focuser_parameter;
 			Move_to(microsteps_target);
 			break;
 		} // end of case move_to
 		case Focuser_Move_command: {
-			microsteps_target = incoming_hub_message.hub_incoming_message.focuser_target;
+			microsteps_target = incoming_hub_message.hub_incoming_message.focuser_parameter;
 			microsteps_direction = incoming_hub_message.hub_incoming_message.focuser_direction;
 			Move(microsteps_target, microsteps_direction);
 			break;
@@ -827,6 +1520,237 @@ void Home(void) {
 	Serial.print(" HOME, Current Position ");
 	Serial.println(current_position,DEC);
 #endif
+}
+void Set_to_Home()  {  // Switch is CLOSED
+	int save = motor_speed;  // save speed setting and set to slow
+	motor_speed = SLOW;
+	update_motor_speed_delay();
+	// recheck state of Home position and keep going till it opens
+	home_position_switch_bounce.update();            // we need to call update to read home position switch state, no interrupts are used
+	home_position_switch_state = home_position_switch_bounce.read();  // reads the home position switch state
+	while (home_position_switch_state == home_position_switch_CLOSED) {
+		clockwise();    // take one step OUT
+		delay(MOTORPULSETIME);
+		// recheck state of Home position and keep going till it opens
+		home_position_switch_bounce.update();            // we need to call update to read home position switch state, no interrupts are used
+		home_position_switch_state = home_position_switch_bounce.read();  // reads the home position switch state
+	}
+	target_position = 0;   // home switch is now open
+	current_position = 0;
+	motor_speed = save;    // restore motorSpeed
+	update_motor_speed_delay();
+}
+void movetohome() { // focuser is at 0 and switch still OPEN
+	int save = motor_speed;  // save speed setting and set to slow
+	motor_speed = SLOW;
+	update_motor_speed_delay();
+	// try to compensate for positional difference in home position switch
+	home_position_switch_bounce.update();            // we need to call update to read home position switch state, no interrupts are used
+	home_position_switch_state = home_position_switch_bounce.read();  // reads the home position switch state
+	while (home_position_switch_state == home_position_switch_OPEN)
+	{
+		anticlockwise();    // take one step IN
+		delay(MOTORPULSETIME);
+		// recheck state of Home position and keep going till it closes
+		home_position_switch_bounce.update();            // we need to call update to read home position switch state, no interrupts are used
+		home_position_switch_state = home_position_switch_bounce.read();  // reads the home position switch state
+	}
+	motor_speed = save;  // restore motorSpeed
+	update_motor_speed_delay();
+}
+void software_Reboot() {
+	asm volatile ("jmp 0");  // jump to the start of the program
+}
+void anticlockwise() { // Move stepper anticlockwise
+	(!myfocuser.Reverse_Direction) ? digitalWrite(OUTLED, 1) : digitalWrite(INLED, 1);
+	(!myfocuser.Reverse_Direction) ? mystepper.step(-1) : mystepper.step(1);
+	delayMicroseconds(MOTORPULSETIME);
+	(!myfocuser.ReverseDirection) ? digitalWrite(OUTLED, 0) : digitalWrite(INLED, 0);
+}
+void clockwise() { // Move stepper clockwise
+	(!myfocuser.Reverse_Direction) ? digitalWrite(INLED, 1) : digitalWrite(OUTLED, 1);
+	(!myfocuser.Reverse_Direction) ? mystepper.step(1) : mystepper.step(-1);
+	delayMicroseconds(MOTORPULSETIME);
+	(!myfocuser.ReverseDirection) ? digitalWrite(INLED, 0) : digitalWrite(OUTLED, 0);
+}
+
+// set the microstepping mode
+void setstepmode(byte stepmode) {
+	if (stepmode == STEP1) {
+		mystepper.SetSteppingMode(SteppingMode::FULL);
+		myfocuser.stepmode = STEP1;
+	} 
+	else if (stepmode == STEP2)	{
+		mystepper.SetSteppingMode(SteppingMode::HALF);
+		myfocuser.stepmode = STEP2;
+	} 
+	else if (step_mode == STEP4) {
+		mystepper.SetSteppingMode(SteppingMode::FULL);
+		myfocuser.stepmode = STEP4;
+	}
+	else if (step_mode == STEP8) {
+		mystepper.SetSteppingMode(SteppingMode::FULL);
+		myfocuser.stepmode = STEP8;
+	}
+	else if (step_mode == STEP16) {
+		mystepper.SetSteppingMode(SteppingMode::FULL);
+		myfocuser.stepmode = STEP16;
+	}
+	else if (step_mode == STEP32) {
+		mystepper.SetSteppingMode(SteppingMode::FULL);
+		myfocuser.stepmode = STEP32;
+	}
+	else if (step_mode == STEP64) {
+		mystepper.SetSteppingMode(SteppingMode::FULL);
+		myfocuser.stepmode = STEP64;
+	}
+	else if (step_mode == STEP128) {
+		mystepper.SetSteppingMode(SteppingMode::FULL);
+		myfocuser.stepmode = STEP128;
+	}
+}
+
+void update_motor_speed_delay() {
+	switch (motor_speed) {
+		case SLOW: // slow
+			switch (myfocuser.step_mode) {
+				case STEP1: // full steps
+					motor_speed_delay = SLOWDELAY1;
+					motor_speed_RPM = motorSpeedSlowRPM;
+					break;
+				case STEP2: // 
+					motor_speed_delay = SLOWDELAY2;
+					motor_speed_RPM = motorSpeedSlowRPM * 2;
+					break;
+				case STEP4: // 
+					motor_speed_delay = SLOWDELAY4;
+					motor_speed_RPM = motorSpeedSlowRPM * 4;
+					break;
+				case STEP8: // 
+					motor_speed_delay = SLOWDELAY8;
+					motor_speed_RPM = motorSpeedSlowRPM * 8;
+					break;
+				case STEP16: //
+					motor_speed_delay = SLOWDELAY16;
+					motor_speed_RPM = motorSpeedSlowRPM * 16;
+					break;
+				case STEP32: //
+					motor_speed_delay = SLOWDELAY32;
+					motor_speed_RPM = motorSpeedSlowRPM * 32;
+					break;
+				case STEP64: //
+					motor_speed_delay = SLOWDELAY64;
+					motor_speed_RPM = motorSpeedSlowRPM * 64;
+					break;
+				case STEP128: //
+					motor_speed_delay = SLOWDELAY128;
+					motor_speed_RPM = motorSpeedSlowRPM * 128;
+					break;
+			}
+			break;
+		case MED: // medium
+			switch (myfocuser.step_mode) {
+			case STEP1: // full steps
+				motor_speed_delay = MEDDELAY1;
+				motor_speed_RPM = motorSpeedMedRPM;
+				break;
+			case STEP2: // 
+				motor_speed_delay = MEDDELAY2;
+				motor_speed_RPM = motorSpeedMedRPM * 2;
+				break;
+			case STEP4: // 
+				motor_speed_delay = MEDDELAY4;
+				motor_speed_RPM = motorSpeedMedRPM * 4;
+				break;
+			case STEP8: // 
+				motor_speed_delay = MEDDELAY8;
+				motor_speed_RPM = motorSpeedMedRPM * 8;
+				break;
+			case STEP16: //
+				motor_speed_delay = MEDDELAY16;
+				motor_speed_RPM = motorSpeedMedRPM * 16;
+				break;
+			case STEP32: //
+				motor_speed_delay = MEDDELAY32;
+				motor_speed_RPM = motorSpeedMedRPM * 32;
+				break;
+			case STEP64: //
+				motor_speed_delay = MEDDELAY64;
+				motor_speed_RPM = motorSpeedMedRPM * 64;
+				break;
+			case STEP128: //
+				motor_speed_delay = MEDDELAY128;
+				motor_speed_RPM = motorSpeedMedRPM * 128;
+				break;
+			}
+		break;
+	case FAST: // fast
+		switch (myfocuser.step_mode {
+			case STEP1: // full steps
+				motor_speed_delay = FASTDELAY1;
+				motor_speed_RPM = motorSpeedFastRPM;
+				break;
+			case STEP2: // 
+				motor_speed_delay = FASTDELAY2;
+				motor_speed_RPM = motorSpeedFastRPM * 2;
+				break;
+			case STEP4: // 
+				motor_speed_delay = FASTDELAY4;
+				motor_speed_RPM = motorSpeedFastRPM * 4;
+				break;
+			case STEP8: // 
+				motor_speed_delay = FASTDELAY8;
+				motor_speed_RPM = motorSpeedFastRPM * 8;
+				break;
+			case STEP16: //
+				motor_speed_delay = FASTDELAY16;
+				motor_speed_RPM = motorSpeedFastRPM * 16;
+				break;
+			case STEP32: //
+				motor_speed_delay = FASTDELAY32;
+				motor_speed_RPM = motorSpeedFastRPM * 32;
+				break;
+			case STEP64: //
+				motor_speed_delay = FASTDELAY64;
+				motor_speed_RPM = motorSpeedFastRPM * 64;
+				break;
+			case STEP128: //
+				motor_speed_delay = FASTDELAY128;
+				motor_speed_RPM = motorSpeedFastRPM * 128;
+				break;
+		}
+		break;
+	}
+	mystepper.set_speed(motor_speed_RPM);      // update the motor speed
+}
+void writeEEPROMNow() {
+	EEPROM_writeAnything(current_address, myfocuser);    // update values in EEPROM
+}
+
+void set_focuser_defaults() {
+	myfocuser.validdata = VALIDDATAFLAG;
+	myfocuser.max_step = 10000L;
+	myfocuser.position = 5000L;
+	myfocuser.coil_power = 1;
+	myfocuser.reverse_direction = 0;
+	myfocuser.step_mode = 1;                             // full stepping
+	myfocuser.page_display_time = DISPLAYPAGETIMEMIN;
+	myfocuser.step_size_enabled = 0;                  // default state is step size OFF
+	myfocuser.step_size = DEFAULTSTEPSIZE;
+	myfocuser.temperature_mode = 1;                          // default is celsius
+	myfocuser.temperature_compensation_enabled = 0;
+	myfocuser.temperature_coefficient = 0;
+	myfocuser.tc_direction = 1;
+	myfocuser.seven_segment_update_on_move = 0;
+	myfocuser.delay_after_move = 0;
+	myfocuser.backlash_steps_in = 0;
+	myfocuser.backlash_steps_out = 0;
+	myfocuser.focuser_direction = MOVINGIN;
+	myfocuser.backlash_in_enabled = 0;
+	myfocuser.backlash_out_enabled = 0;
+	writeEEPROMNow();                                   // update values in EEPROM
+	is_moving = 0;
+	move_started = 0;
 }
 void store_position_in_eeprom(int position_now) {
 	EEPROM.update(Last_position_address, (position_now / 0xff));
