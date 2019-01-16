@@ -57,6 +57,12 @@
 #define RUNNING_LED_pin		49		// 49 = Green
 #define HUB_LED_pin			48		// 48 = Blue
 #define GPS_LED_pin			46		// 46 = Red
+#define PBSWITCHESPIN       A0            // push button switches
+#define INLED               A1            // in and out leds
+#define OUTLED              A2
+#define BUZZERPIN           A3            // buzzer
+#define TEMPPIN             2             // temperature probe on pin 2, use 4.7k pullup
+#define HPSWPIN             12            // home position switch is on D12
 #define postStepDelayUs		100
 
 //#define focuser_to_HUB_Update_command	0x05
@@ -101,12 +107,7 @@
 // ----------------------------------------------------------------------------------------------------------
 // GLOBAL DEFINES
 // DO NOT CHANGE
-#define PBSWITCHESPIN       A0            // push button switches
-#define INLED               A1            // in and out leds
-#define OUTLED              A2
-#define BUZZERPIN           A3            // buzzer
-#define TEMPPIN             2             // temperature probe on pin 2, use 4.7k pullup
-#define HPSWPIN             12            // home position switch is on D12
+
 
 #define EEPROMSIZE          1024          // ATMEGA328P 1024 EEPROM
 #define VALIDDATAFLAG       99            // valid eeprom data flag
